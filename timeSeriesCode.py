@@ -14,15 +14,17 @@ from sklearn.metrics import mean_squared_error
 
 import torch
 import torch.nn as nn
+from torch.autograd import Variable
 
 
 class arima001tsModule(nn.Module):
     
-    def __init__(self, maParam, driftParam):
+    def __init__(self, maParam, driftParam, noiseSigma):
         
         super(arima001tsModule, self).__init__()
 
         self.driftParam = driftParam
+        self.noiseSigma = noiseSigma
         
         # Define ma parameters
         self.maParam = torch.tensor(maParam)
@@ -43,7 +45,7 @@ class arima001tsModule(nn.Module):
     def forward(self, nSamp):
         
         # Generate vector of nSamp iid normally distributed samples
-        epsVec = torch.normal(mean=0, std=0.5, size=(1, nSamp))
+        epsVec = torch.normal(mean=0, std=self.noiseSigma, size=(1, nSamp))
         epsVec = epsVec.unsqueeze(0)
         
         # Apply MA transform to generate MA vec. xt = theta1*eps_(t-1) + eps_t
@@ -92,7 +94,7 @@ def evaluateArima(dataSets, valSize, order):
         
         model = ARIMA(trainSet, order=order)
         # model = ARIMA(trainSet, order=order, trend='t')
-        # model = sarimax(trainSet, order=order, trend='c', initialization='diffuse')
+        # model = SARIMAX(trainSet, order=order, seasonal_order=(0,0,0,0), initialization='diffuse')
         
         fitted = model.fit()
         
@@ -112,69 +114,91 @@ def main():
     ## I. Create a PyTorch module describing an ARIMA(0,1,1) time series
     maParam = 0.8
     driftParam = 0.2
+    noiseSigma = 0.5
 
-    tsModule = arima001tsModule(maParam, driftParam)
-
+    tsModule = arima001tsModule(maParam, driftParam, noiseSigma)
+    
     ## II. Generate a random 20 sample long ARIMA(0,1,1) time series with drift
+    
     numSamp = 20
     ts = tsModule(numSamp)
-    
-    
-    from statsmodels.tsa.stattools import adfuller
-    dftest = adfuller(ts.squeeze().numpy(), autolag='AIC')
-    print("1. ADF : ",dftest[0])
-    print("2. P-Value : ", dftest[1])
-    print("3. Num Of Lags : ", dftest[2])
-    print("4. Num Of Observations Used For ADF Regression and Critical Values Calculation :", dftest[3])
-    print("5. Critical Values :")
-    for key, val in dftest[4].items():
-        print("\t",key, ": ", val)
-    
-    
+    ts = ts.squeeze()
     
     ## III. Fit ARIMA model parameters using the first 14 samples of the data series
-    
-    # Define data sets for cross validation
     numTrainSamp = 14
-    valSize = 1
-    minTrainSetLen = 3
-
-    dataSets = prepareTrainValSets(ts, minTrainSetLen, numTrainSamp, valSize)
-
-    # Values for ARIMA parameters grid search
-    pVec = [0, 1, 2, 3, 4]
-    dVec = [0, 1, 2, 3]
-    qVec = [0, 1, 2, 3]
     
-    pVec = [0, 1, 2]
-    dVec = [0, 1, 2]
-    qVec = [0, 1, 2]
-    
-    bestOrder = (0,0,0)
-    bestMse = torch.inf
-    for p in pVec:
-        for d in dVec:
-            for q in qVec:
-                
-                order = (p,d,q)
-                try:
-                    mseScore = evaluateArima(dataSets, valSize, order)
-                    
-                    if mseScore < bestMse:
-                        bestOrder = order
-                        bestMse = mseScore
+    # Get trainig vector
+    tsTrain = ts[:numTrainSamp]
 
-                    if order == (0,1,1):
-                        reqOrderMse = mseScore
-                    
-                    print(f'ARIMA{order}, MSE={mseScore}')
-                    
-                except:
-                    continue
+    # Set parameters to estimate
+    maParamEst = Variable(torch.rand(1), requires_grad=True)
+    deltaEst = Variable(torch.rand(1), requires_grad=True)
+    sigmaEst = Variable(torch.rand(1), requires_grad=True)
     
-    print(f"Best ARIMA order is {bestOrder} with MSE {bestMse}")
-    if 'reqOrderMse' in globals(): print(f"ARIMA(0,1,1) MSE is {reqOrderMse}")
+    # Construct eps vector
+    # epsVec = torch.zeros(numTrainSamp)
+    # for kk in range(1, numTrainSamp):
+    #     epsVec[kk] = tsTrain[kk] - tsTrain[kk-1] - deltaEst - maParamEst*epsVec[kk-1]
 
+    # Set optimizer
+    lr = 0.02
+    optimizer = torch.optim.Adam([maParamEst, deltaEst, sigmaEst], lr=lr)
+    
+    nIter = 1000
+    
+    Lhistory = []
+    maParamHistory = []
+    deltaHistory = []
+    sigmaHistory = []
+    
+    with torch.autograd.set_detect_anomaly(True):
+        
+        # Start training
+        for iter in range(nIter):
+            
+            optimizer.zero_grad()
+            
+            Ltheta = 1
+            prevEps = 0
+            for kk in range(1, numTrainSamp):
+                currEps = tsTrain[kk] - tsTrain[kk-1] - deltaEst - maParamEst*prevEps
+                currEps = -(currEps**2)/2/sigmaEst**2
+                currEps = torch.exp(currEps)
+                currEps = currEps/(2*torch.pi*sigmaEst**2)**0.5
+                Ltheta = Ltheta*currEps  
+            
+            Lhistory.append(Ltheta.data.numpy()[0])
+            maParamHistory.append(maParamEst.data.numpy()[0])
+            deltaHistory.append(deltaEst.data.numpy()[0])
+            sigmaHistory.append(sigmaEst.data.numpy()[0])
+            
+            Ltheta.backward()
+            
+            print(f'Iteration={iter}, '
+                  f'L={Ltheta.data.numpy()}, '
+                  f'maParam={maParamEst.data.numpy()}, '
+                  f'driftParam={deltaEst.data.numpy()}, '
+                  f'sigma={sigmaEst.data.numpy()}')
+            
+            optimizer.step()
+
+    # Visualize data generation stages
+    corrFactor = np.max((maParamHistory, deltaHistory, sigmaHistory))/np.max(Lhistory)
+    plt.figure()
+    plt.plot(np.array(Lhistory)*corrFactor, label=f'ML*{corrFactor}')
+    plt.plot(maParamHistory, label='ma')
+    plt.plot(deltaHistory, label='drift param.')
+    plt.plot(sigmaHistory, label='sigma')
+    
+    plt.grid(True)
+    plt.title(f'Optimization history. lr={lr}, nIter={nIter}\n'
+              f'ma={maParam}, driftParam={driftParam}, noiseSigma={noiseSigma}')
+    plt.legend()
+    plt.show()
+
+    
+    
+    
     pass
     
     
@@ -184,3 +208,4 @@ if __name__=="__main__":
     
     os.system('cls')
     main()
+
