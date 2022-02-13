@@ -1,16 +1,8 @@
 
-
-from importlib.metadata import requires
 import os
 import numpy as np
 
 import matplotlib.pyplot as plt
-
-from statsmodels.tsa.arima.model import ARIMA
-from statsmodels.tsa.statespace.sarimax import SARIMAX
-
-from sklearn.model_selection import GridSearchCV
-from sklearn.metrics import mean_squared_error
 
 import torch
 import torch.nn as nn
@@ -61,6 +53,7 @@ class arima001tsModule(nn.Module):
         plt.plot(maVec.squeeze().numpy(), label='ma')
         plt.plot(imaVec.squeeze().numpy(), label='ima')
         plt.plot(imaDriftVec.squeeze().numpy(), label='ima + drift')
+        plt.title('Data generation stages')
         
         plt.grid(True)
         plt.legend()
