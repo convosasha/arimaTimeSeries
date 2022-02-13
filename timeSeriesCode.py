@@ -39,9 +39,6 @@ class arima001tsModule(nn.Module):
                                         bias=False)
         self.conv1dOperator.weight = nn.Parameter(ma, requires_grad=False)
         
-        # print(self.conv1dOperator.weight)
-
-        
     def forward(self, nSamp):
         
         # Generate vector of nSamp iid normally distributed samples
@@ -55,7 +52,7 @@ class arima001tsModule(nn.Module):
         imaVec = torch.cumsum(maVec, dim=2)
         
         # Add drift
-        driftVec = torch.cumsum(torch.ones(nSamp), dim=0)*self.driftParam
+        driftVec = torch.cumsum(torch.ones(nSamp), dim=0)*self.driftParam - self.driftParam
         imaDriftVec = imaVec + driftVec
           
         # Visualize data generation stages
@@ -71,43 +68,100 @@ class arima001tsModule(nn.Module):
         
         return imaDriftVec
 
-def prepareTrainValSets(ts, minTrainSetLen, numTrainSamp, valSize):
+def fitModelhiddenParams(nIter, numTrainSamp, tsTrain, lr, optimizer,
+                         maParam, driftParam, noiseSigma,
+                         maParamEst, deltaEst, sigmaEst):
+
+    Lhistory = []
+    maParamHistory = []
+    deltaHistory = []
+    sigmaHistory = []
     
-    trainSetLenRange = range(minTrainSetLen, numTrainSamp - valSize + 1)
-
-    dataSets = []
-    for currTrainSetLen in trainSetLenRange:
+    # Start training
+    for iter in range(nIter):
         
-        trainSet = ts[:, :, 0:currTrainSetLen].squeeze().numpy()
-        valSet = ts[:, :, currTrainSetLen:(currTrainSetLen + valSize)].squeeze().numpy()
+        optimizer.zero_grad()
+        
+        Ltheta = 1
+        prevEps = tsTrain[0]
+        for kk in range(1, numTrainSamp):
+            currEps = tsTrain[kk] - tsTrain[kk-1] - deltaEst - maParamEst*prevEps
+            prevEps = currEps
+            
+            fTheta = -(currEps**2)/2/sigmaEst**2
+            fTheta = torch.exp(fTheta)
+            fTheta = fTheta/(2*torch.pi*sigmaEst**2)**0.5
+            Ltheta = Ltheta*fTheta
+        
+        Lhistory.append(Ltheta.data.numpy()[0])
+        maParamHistory.append(maParamEst.data.numpy()[0])
+        deltaHistory.append(deltaEst.data.numpy()[0])
+        sigmaHistory.append(sigmaEst.data.numpy()[0])
+        
+        Ltheta = -Ltheta
 
-        dataSets.append([trainSet, valSet])
+        Ltheta.backward()
+        
+        if iter % 50 == 0:
+            print(f'Iteration={iter:05d}, '
+                f'L={Ltheta.data.numpy()}, '
+                f'maParam={maParamEst.data.numpy()}, '
+                f'driftParam={deltaEst.data.numpy()}, '
+                f'sigma={sigmaEst.data.numpy()}')
+        
+        optimizer.step()
     
-    return dataSets
+    # Visualize training process
+    corrFactor = np.max((maParamHistory, deltaHistory, sigmaHistory))/np.max(Lhistory)
+    plt.figure()
+    plt.plot(np.array(Lhistory)*corrFactor, label=f'ML*{corrFactor}')
+    plt.plot(maParamHistory, label=f'ma={maParam}')
+    plt.plot(deltaHistory, label=f'drift param={driftParam}')
+    plt.plot(sigmaHistory, label=f'sigma={noiseSigma}')
     
+    plt.grid(True)
+    plt.title(f'Optimization history. lr={lr}, nIter={nIter}\n'
+              f'ma={maParam}, driftParam={driftParam}, noiseSigma={noiseSigma}')
+    plt.legend(loc='best')
+    plt.show(block=False)
 
-def evaluateArima(dataSets, valSize, order):
+    return maParamHistory[-1], deltaHistory[-1], sigmaHistory[-1], currEps.data.numpy()[0]
 
-    preds = []
-    vals = []
-    for [trainSet, valSet] in dataSets:
-        
-        model = ARIMA(trainSet, order=order)
-        # model = ARIMA(trainSet, order=order, trend='t')
-        # model = SARIMAX(trainSet, order=order, seasonal_order=(0,0,0,0), initialization='diffuse')
-        
-        fitted = model.fit()
-        
-        preds.extend(list(fitted.simulate(nsimulations=valSize, alpha=0.05, anchor='end')))
-        
-        if valSize > 1:
-            vals.extend(list(valSet))
-        else:
-            vals.append(np.float32(valSet))
-
-    mseScore = mean_squared_error(vals, preds)
+def predictWithEstimatedParams(ts, tsTrain,
+        numSamp, numTrainSamp,
+        lr, nIter,
+        maParam, driftParam, noiseSigma,
+        noisesigmaEstimated, driftParamEstimated, maParamEstimated, lastEps):
     
-    return mseScore
+    forecastSamples = []
+    prevSamp = tsTrain[-1]
+    prevEps = lastEps
+    for kk in range(numSamp - numTrainSamp):
+        
+        currEps = torch.normal(mean=0, std=float(noisesigmaEstimated), size=(1, 1)).squeeze()
+        
+        currPredSamp = prevSamp + driftParamEstimated + currEps + maParamEstimated*prevEps
+        forecastSamples.append(float(currPredSamp.numpy()))
+        
+        prevEps = currEps
+        prevSamp = currPredSamp
+    
+    # Visualize train set, test set and predictions
+    xData = range(numSamp)
+
+    fig, ax = plt.subplots()
+    ax.autoscale(enable=True, axis='y', tight=True)
+    ax.plot(tsTrain, label='training')
+    ax.plot(xData[numTrainSamp:], ts[numTrainSamp:], numTrainSamp, label='actual')
+    ax.plot(xData[numTrainSamp:], forecastSamples, label='forecasted')
+        
+    ax.grid(True)
+    ax.set_title(f'Train result. lr={lr}, nIter={nIter}\n'
+                 f'ma={maParam}, driftParam={driftParam}, noiseSigma={noiseSigma}')
+    ax.legend(loc='best')
+
+    plt.show(block=False)
+
 
 def main():
     
@@ -119,7 +173,6 @@ def main():
     tsModule = arima001tsModule(maParam, driftParam, noiseSigma)
     
     ## II. Generate a random 20 sample long ARIMA(0,1,1) time series with drift
-    
     numSamp = 20
     ts = tsModule(numSamp)
     ts = ts.squeeze()
@@ -129,83 +182,34 @@ def main():
     
     # Get trainig vector
     tsTrain = ts[:numTrainSamp]
-
-    # Set parameters to estimate
-    maParamEst = Variable(torch.rand(1), requires_grad=True)
-    deltaEst = Variable(torch.rand(1), requires_grad=True)
-    sigmaEst = Variable(torch.rand(1), requires_grad=True)
     
-    # Construct eps vector
-    # epsVec = torch.zeros(numTrainSamp)
-    # for kk in range(1, numTrainSamp):
-    #     epsVec[kk] = tsTrain[kk] - tsTrain[kk-1] - deltaEst - maParamEst*epsVec[kk-1]
+    # Set and initialize parameters to estimate
+    maParamEst = Variable(torch.rand(1) + 0.2, requires_grad=True)
+    deltaEst = Variable(torch.rand(1) + 0.2, requires_grad=True)
+    sigmaEst = Variable(torch.rand(1) + 0.2, requires_grad=True)
 
     # Set optimizer
-    lr = 0.02
+    lr = 0.002
     optimizer = torch.optim.Adam([maParamEst, deltaEst, sigmaEst], lr=lr)
     
-    nIter = 1000
+    nIter = 2000
     
-    Lhistory = []
-    maParamHistory = []
-    deltaHistory = []
-    sigmaHistory = []
+    maParamEstimated, driftParamEstimated, noisesigmaEstimated, lastEps = \
+        fitModelhiddenParams(nIter, numTrainSamp, tsTrain, lr, optimizer,
+                             maParam, driftParam, noiseSigma,
+                             maParamEst, deltaEst, sigmaEst)  
     
-    with torch.autograd.set_detect_anomaly(True):
-        
-        # Start training
-        for iter in range(nIter):
-            
-            optimizer.zero_grad()
-            
-            Ltheta = 1
-            prevEps = 0
-            for kk in range(1, numTrainSamp):
-                currEps = tsTrain[kk] - tsTrain[kk-1] - deltaEst - maParamEst*prevEps
-                currEps = -(currEps**2)/2/sigmaEst**2
-                currEps = torch.exp(currEps)
-                currEps = currEps/(2*torch.pi*sigmaEst**2)**0.5
-                Ltheta = Ltheta*currEps  
-            
-            Lhistory.append(Ltheta.data.numpy()[0])
-            maParamHistory.append(maParamEst.data.numpy()[0])
-            deltaHistory.append(deltaEst.data.numpy()[0])
-            sigmaHistory.append(sigmaEst.data.numpy()[0])
-            
-            Ltheta.backward()
-            
-            print(f'Iteration={iter}, '
-                  f'L={Ltheta.data.numpy()}, '
-                  f'maParam={maParamEst.data.numpy()}, '
-                  f'driftParam={deltaEst.data.numpy()}, '
-                  f'sigma={sigmaEst.data.numpy()}')
-            
-            optimizer.step()
-
-    # Visualize data generation stages
-    corrFactor = np.max((maParamHistory, deltaHistory, sigmaHistory))/np.max(Lhistory)
-    plt.figure()
-    plt.plot(np.array(Lhistory)*corrFactor, label=f'ML*{corrFactor}')
-    plt.plot(maParamHistory, label='ma')
-    plt.plot(deltaHistory, label='drift param.')
-    plt.plot(sigmaHistory, label='sigma')
+    # Make forecast using the fitted params
+    predictWithEstimatedParams(ts, tsTrain,
+        numSamp, numTrainSamp,
+        lr, nIter,
+        maParam, driftParam, noiseSigma,
+        noisesigmaEstimated, driftParamEstimated, maParamEstimated, lastEps)
     
-    plt.grid(True)
-    plt.title(f'Optimization history. lr={lr}, nIter={nIter}\n'
-              f'ma={maParam}, driftParam={driftParam}, noiseSigma={noiseSigma}')
-    plt.legend()
     plt.show()
-
-    
-    
-    
-    pass
-    
-    
     
 
 if __name__=="__main__":
     
     os.system('cls')
     main()
-
